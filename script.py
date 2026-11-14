@@ -1,75 +1,74 @@
-import requests
-from google.cloud import bigquery
-import os
-from datetime import datetime
-import pandas as pd
+"""Télécharge le CSV des prix des carburants (data.gouv.fr), le nettoie
+et écrit data/stations.json pour l'application Android."""
+import io
 import json
+import os
 
+import pandas as pd
+import requests
 
-
-# Get the credentials from the environment variable (using GH secrets)
-credentials_json = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
-credentials_info = json.loads(credentials_json)
-
-# URL of the CSV file + path to save it
 URL = "https://www.data.gouv.fr/fr/datasets/r/edd67f5b-46d0-4663-9de9-e5db1c880160"
-CSV_FILE_PATH = 'daily_prices.csv'
+OUTPUT_PATH = os.path.join("data", "stations.json")
+
+# Colonnes du CSV -> clé courte du carburant
+FUELS = {
+    "gazole": "Prix Gazole",
+    "sp95": "Prix SP95",
+    "e10": "Prix E10",
+    "sp98": "Prix SP98",
+    "e85": "Prix E85",
+    "gplc": "Prix GPLc",
+}
 
 
+def main():
+    local_csv = os.environ.get("LOCAL_CSV")  # pour tester sans télécharger
+    if local_csv:
+        content = open(local_csv, "rb").read()
+    else:
+        r = requests.get(URL, timeout=120)
+        r.raise_for_status()
+        content = r.content
+    df = pd.read_csv(io.BytesIO(content), sep=";", encoding="utf-8-sig", dtype={"Code postal": str})
 
-# BigQuery configuration      (Update with your GCP project ID, dataset ID and table ID)
-PROJECT_ID = 'trans-engine-356414'    # Update with your GCP project ID
-DATASET_ID = 'fuel'    # Update with your dataset ID
-TABLE_ID = 'daily_price'
+    # Les coordonnées sont stockées multipliées par 100 000
+    df["lat"] = pd.to_numeric(df["latitude"], errors="coerce") / 100000
+    df["lon"] = pd.to_numeric(df["longitude"], errors="coerce") / 100000
+    df = df.dropna(subset=["lat", "lon"])
+    # Garde uniquement des coordonnées plausibles (France + outre-mer)
+    df = df[df["lat"].between(-90, 90) & df["lon"].between(-180, 180)]
 
+    stations = []
+    for _, row in df.iterrows():
+        prices = {}
+        for key, col in FUELS.items():
+            price = pd.to_numeric(row.get(col), errors="coerce")
+            if pd.notna(price):
+                entry = {"prix": round(float(price), 3)}
+                maj = row.get(f"{col} mis à jour le")
+                if pd.notna(maj):
+                    entry["maj"] = str(maj)
+                prices[key] = entry
+        if not prices:
+            continue
+        stations.append({
+            "id": int(row["id"]),
+            "lat": round(float(row["lat"]), 5),
+            "lon": round(float(row["lon"]), 5),
+            "adresse": row["Adresse"] if pd.notna(row["Adresse"]) else "",
+            "ville": row["Ville"] if pd.notna(row["Ville"]) else "",
+            "cp": row["Code postal"] if pd.notna(row["Code postal"]) else "",
+            "prix": prices,
+        })
 
-# Download and read the CSV file
-r = requests.get(URL)
-
-with open(CSV_FILE_PATH, 'wb') as f:
-    f.write(r.content)
-
-
-# Read the df with Pandas and then ceate a csv (was needed because of an error reading columns with french accents)
-df = pd.read_csv(CSV_FILE_PATH, sep = ';')
-
-df.columns = ["station_id", "latitude", "longitude", "code_postal", "pop", "adresse", "ville", "services", "prix", "rupture",
-              "horaires", "geom", "prix_gazole_updated", "prix_gazole", "prix_sp95_updated", "prix_sp95",
-              "prix_e85_updated", "prix_e85", "prix_gplc_updated", "prix_gplc", "prix_e10_updated", "prix_ep10",
-              "prix_sp98_updated", "prix_sp98", "debut_rupture_e10", "type_rupture_e10",
-              "debut_rupture_sp98", "type_rupture_sp98", "debut_rupture_sp95", "type_rupture_sp95",
-              "debut_rupture_e85", "type_rupture_e85", "debut_rupture_glpc", "type_rupture_glpc",
-              "debut_rupture_gazole", "type_rupture_gazole", 'carburants_dispos','carburants_indispos',
-              'carburants_rupture_tempo', 'carburants_rupture_def', 'automate_24', 'services_propos', 'departement',
-              'code_depart', 'region', 'code_region', 'horaires_detail']
-
-
-df.to_csv(CSV_FILE_PATH, index=False)
-
-
-
-# Upload to BigQuery
-client = bigquery.Client.from_service_account_info(credentials_info)
-table_ref = client.dataset(DATASET_ID).table(TABLE_ID)
-
-
-
-# Configure load job
-job_config = bigquery.LoadJobConfig(
-    source_format=bigquery.SourceFormat.CSV,
-    field_delimiter=',',
-    skip_leading_rows=1,  # Adjust if your CSV doesn't have header
-    autodetect=True,      # Automatically detect schema
-    write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE   # to override the table by the new csv everyday
-)
-
-
-# Upload file to BQ
-with open(CSV_FILE_PATH, 'rb') as source_file:
-    job = client.load_table_from_file(
-        source_file,
-        table_ref,
-        job_config=job_config
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(
+            {"generated_at": pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds"), "stations": stations},
+            f, ensure_ascii=False, separators=(",", ":"),
         )
+    print(f"{len(stations)} stations écrites dans {OUTPUT_PATH}")
 
-job.result()
+
+if __name__ == "__main__":
+    main()
